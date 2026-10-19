@@ -57,6 +57,10 @@ String hmacSha256(const String &message) {
     static const char hexDigits[] = "0123456789abcdef";
     char hex_output[65];
     for (int i = 0; i < 32; i++) {
+        // Micro-fat pointer bounds check: check_bounds(i*2 + 1, 0, 65)
+        if ((i * 2 + 1) >= 65) {
+            break;
+        }
         unsigned char value = output[i];
         hex_output[i * 2]     = hexDigits[(value >> 4) & 0x0F];
         hex_output[i * 2 + 1] = hexDigits[value & 0x0F];
@@ -99,14 +103,23 @@ uint16_t calculateCRC16(const uint8_t* data, size_t len) {
 }
 
 uint16_t computeFrameAuthTag(const uint8_t* header, size_t header_len, const uint8_t* payload, size_t payload_len) {
-    const char* key = HMAC_SECRET;
-    size_t key_len = strlen(key);
-    size_t total_len = key_len + header_len + payload_len;
-    uint8_t* buf = new uint8_t[total_len];
-    memcpy(buf, key, key_len);
-    memcpy(buf + key_len, header, header_len);
-    memcpy(buf + key_len + header_len, payload, payload_len);
-    uint16_t auth_tag = calculateCRC16(buf, total_len);
-    delete[] buf;
+    unsigned char hmac_output[32];
+    mbedtls_md_context_t ctx;
+    const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+
+    mbedtls_md_init(&ctx);
+    mbedtls_md_setup(&ctx, info, 1);
+    mbedtls_md_hmac_starts(&ctx, (const unsigned char*)HMAC_SECRET, strlen(HMAC_SECRET));
+    if (header != nullptr && header_len > 0) {
+        mbedtls_md_hmac_update(&ctx, header, header_len);
+    }
+    if (payload != nullptr && payload_len > 0) {
+        mbedtls_md_hmac_update(&ctx, payload, payload_len);
+    }
+    mbedtls_md_hmac_finish(&ctx, hmac_output);
+    mbedtls_md_free(&ctx);
+
+    // 16-bit Truncated HMAC-SHA256 per RFC 2104 (MSB 2 bytes)
+    uint16_t auth_tag = ((uint16_t)hmac_output[0] << 8) | (uint16_t)hmac_output[1];
     return auth_tag;
 }

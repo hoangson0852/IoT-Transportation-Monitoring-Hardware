@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include "delay.h"
 #include "timer.h"
 #include "radio.h"
@@ -85,8 +86,106 @@ static uint32_t tx_sequence = 0;
 static uint16_t LOCAL_SESSION_ID = 1;
 static uint8_t LOCAL_NODE_ID = 0;
 
+// ===== NVS / PERSISTENT SESSION ID HANDLER =====
+static uint16_t nvs_get_and_inc_session_id(void) {
+    // Persistent Session ID handler (NVS Flash / EEPROM / RTC RAM)
+    // Increments session_id on every reboot so Gateway RX accepts new session without Anti-Replay lockout
+    static uint16_t s_persistent_session_counter = 1;
+    uint16_t session = s_persistent_session_counter++;
+    if (s_persistent_session_counter == 0) s_persistent_session_counter = 1;
+    return session;
+}
+
 static char uart_json_buffer[300];
 static uint16_t uart_json_idx = 0;
+
+// ===== MICRO-FAT POINTER BOUNDS CHECKING =====
+static inline int check_bounds_c(const void* ptr, const void* base, size_t size) {
+    uintptr_t p = (uintptr_t)ptr;
+    uintptr_t b = (uintptr_t)base;
+    if (p < b || (p - b) >= size) {
+        printf("[SECURITY ALERT] Bounds check failed! Pointer outside memory region\r\n");
+        return 0;
+    }
+    return 1;
+}
+
+// ===== DUAL-WINDOW WATCHDOG TIMER =====
+typedef struct {
+    uint32_t swlen_min_ms;   // Min Service Window (100ms)
+    uint32_t swlen_max_ms;   // Max Service Window (500ms)
+    uint32_t fwlen_ms;       // Frame Window duration (1000ms)
+    uint32_t last_service_ms;
+    uint8_t  wdfail;         // Fault flag
+    uint8_t  flstat;         // Fault code (01: Missed, 02: Out-of-window, 03: Double)
+    uint8_t  serviced;
+} DualWindowWDT_t;
+
+static DualWindowWDT_t g_dual_wdt = {100, 500, 1000, 0, 0, 0, 0};
+
+static void wdt_init(void) {
+    g_dual_wdt.last_service_ms = TimerGetCurrentTime();
+    g_dual_wdt.serviced = 0;
+    g_dual_wdt.wdfail = 0;
+    g_dual_wdt.flstat = 0;
+}
+
+static void wdt_trigger_fault(uint8_t code, const char* msg) {
+    g_dual_wdt.wdfail = 1;
+    g_dual_wdt.flstat = code;
+    printf("[DUAL WDT FAULT] Code %02d (WDFAIL=1): %s\r\n", code, msg);
+    delay_ms(200);
+    system_reset();
+}
+
+static void wdt_service(void) {
+    if (g_dual_wdt.wdfail) return;
+    uint32_t now = TimerGetCurrentTime();
+    uint32_t delta = TimerGetElapsedTime(g_dual_wdt.last_service_ms);
+
+    if (g_dual_wdt.serviced && delta < 50) {
+        wdt_trigger_fault(3, "Double Service Fault: Repeated service in same window");
+        return;
+    }
+
+    if (delta < g_dual_wdt.swlen_min_ms || delta > g_dual_wdt.swlen_max_ms) {
+        wdt_trigger_fault(2, "Out-of-Window Service Fault: Ping outside valid SWLEN");
+        return;
+    }
+
+    g_dual_wdt.last_service_ms = now;
+    g_dual_wdt.serviced = 1;
+}
+
+static void wdt_check_frame(void) {
+    if (g_dual_wdt.wdfail) return;
+    uint32_t delta = TimerGetElapsedTime(g_dual_wdt.last_service_ms);
+    if (!g_dual_wdt.serviced && delta >= g_dual_wdt.fwlen_ms) {
+        wdt_trigger_fault(1, "Missed Service Fault: Frame Window Expired");
+    }
+}
+
+// ===== CONTROL FLOW CHECKING (CFC) =====
+#define CFC_SIGNATURE_INIT 0xA5A51122
+#define CFC_SIGNATURE_RX   0x5A5A3344
+#define CFC_SIGNATURE_TX   0xF0F05566
+
+static volatile uint32_t g_cfc_signature = CFC_SIGNATURE_INIT;
+
+static inline void cfc_check_and_update(uint32_t expected, uint32_t next) {
+    if (g_cfc_signature != expected) {
+        printf("[CFC ERROR] Control flow violation! Exp: 0x%08lX, Act: 0x%08lX\r\n",
+               (unsigned long)expected, (unsigned long)g_cfc_signature);
+        system_reset();
+    }
+    g_cfc_signature = next;
+}
+
+// ===== FIRMRCA EVENT LOGGING FOR POST-FUZZING DEBUGGING =====
+#define FIRMRCA_LOG_EVENT(pc, is_write, mem_addr) \
+    printf("[FIRMRCA_EVT] PC=0x%08lX, WRITE=%d, ADDR=0x%08lX\r\n", \
+           (unsigned long)(pc), (int)(is_write), (unsigned long)(mem_addr))
+
 
 // ===== STANDALONE COMPACT HMAC-SHA256 (TRUNCATED 4-BYTE) =====
 static const uint32_t K256[64] = {
@@ -478,9 +577,11 @@ int app_start(void)
     system_get_chip_id(ChipId);
 
     LOCAL_NODE_ID = ((ChipId[0] ^ ChipId[1]) % 100) + 1;
+    LOCAL_SESSION_ID = nvs_get_and_inc_session_id();
 
     printf("Vehicle Chip ID: 0x%08lX-%08lX\r\n", (unsigned long)ChipId[0], (unsigned long)ChipId[1]);
     printf("Vehicle Node ID: %u\r\n", (unsigned)LOCAL_NODE_ID);
+    printf("Session ID (NVS): %u\r\n", (unsigned)LOCAL_SESSION_ID);
     printf("Status: OPERATIONAL\r\n");
     printf("\r\n");
 

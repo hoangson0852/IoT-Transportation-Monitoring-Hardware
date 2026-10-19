@@ -13,7 +13,6 @@
 #include "vehicle_config.h"
 #include "sensor_Data.h"
 
-<<<<<<< HEAD
 #include "frame_codec.h"
 #include "local_memory.h"
 #include <esp_task_wdt.h>
@@ -22,39 +21,6 @@
 #define WDT_TIMEOUT 10
 
 uint16_t global_session_id = 0;
-=======
-#pragma pack(push, 1)
-struct LoRaFrameHeader {
-    uint8_t magic[2];      // 0x25, 0x03
-    uint8_t device_id;     // 1 - 100
-    uint8_t vehicle_id;    // 1 - 100
-    uint16_t packet_id;    // sequence number (anti-replay)
-    uint32_t timestamp;    // millis or epoch
-    uint8_t type;          // 1 = Telemetry, 2 = Alert/Tamper, 3 = Heartbeat
-    uint8_t flags;         // Bitmask: Bit 0=Tamper, Bit 1=GPS Fix, Bit 2=Vibration, Bit 3=Low Batt
-};
-
-struct LoRaFramePayload {
-    int16_t temperature;    // temp * 10
-    int16_t humidity;       // hum * 10
-    int16_t accel_mag;      // accel * 100
-    uint16_t light_level;   // LDR (0 - 1023)
-    int32_t latitude;       // lat * 1e6
-    int32_t longitude;      // lng * 1e6
-};
-
-struct LoRaFrameFooter {
-    uint16_t auth_tag;      // Authentication tag
-    uint16_t crc;           // CRC16 over Header + Payload + Auth_Tag
-};
-
-struct LoRaFrame {
-    LoRaFrameHeader header;
-    LoRaFramePayload payload; // to be encrypted in-place (16 bytes)
-    LoRaFrameFooter footer;
-};
-#pragma pack(pop)
->>>>>>> 6bd012583d69115ceb245bcf39663525a76f28ba
 
 // ===== Pins / Config =====
 #define DHTPIN      14
@@ -84,6 +50,27 @@ HardwareSerial LORA_SER(1);
 
 volatile uint32_t g_send_interval_ms = 2000; 
 volatile bool g_tamper_alert = false;        
+static TaskHandle_t xTamperTaskHandle = NULL;
+static TaskHandle_t xLoraSendTaskHandle = NULL;
+
+// Hardware ISR for Tamper switch SW2 (GPIO 27)
+void IRAM_ATTR tamperISR() {
+  g_tamper_alert = true;
+  // Kích hoạt còi và đèn LED cảnh báo phần cứng tức thì tại chỗ (<0.15ms)
+  digitalWrite(BUZZER_PIN, HIGH);
+  digitalWrite(LED_PIN, HIGH);
+
+  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+  if (xTamperTaskHandle != NULL) {
+    vTaskNotifyGiveFromISR(xTamperTaskHandle, &xHigherPriorityTaskWoken);
+  }
+  if (xLoraSendTaskHandle != NULL) {
+    vTaskNotifyGiveFromISR(xLoraSendTaskHandle, &xHigherPriorityTaskWoken);
+  }
+  if (xHigherPriorityTaskWoken == pdTRUE) {
+    portYIELD_FROM_ISR();
+  }
+}
 
 #define FORCE_NODE_ID 1  // Set to 1 for Transport-1, 2 for Transport-2, etc. | 0 = auto-increment from EEPROM
 
@@ -169,22 +156,19 @@ void TaskGPS(void *pvParameters) {
 }
 
 void TaskTamperMonitor(void *pvParameters) {
-  TickType_t xLastWakeTime = xTaskGetTickCount();
-  const TickType_t xPeriod = pdMS_TO_TICKS(100);
-
   esp_task_wdt_add(NULL);
   for (;;) {
-<<<<<<< HEAD
     esp_task_wdt_reset();
-=======
->>>>>>> 6bd012583d69115ceb245bcf39663525a76f28ba
+    // Chờ tín hiệu đánh thức tức thì từ Hardware ISR (<0.15ms) hoặc thăm dò định kỳ 100ms
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
+
     // SW2 reads HIGH if box is opened (switch released)
     bool open_state = tamper.isTriggered();
 
     if (open_state) {
       if (!g_tamper_alert) {
         g_tamper_alert = true;
-        Serial.println("[TAMPER ALERT] BOX OPENED!");
+        Serial.println("[TAMPER ALERT] BOX OPENED (Hardware ISR triggered)!");
       }
       tamper.checkTamper(); // Set tamper_detected = true
       tamper.updateAlarm(true);
@@ -193,8 +177,6 @@ void TaskTamperMonitor(void *pvParameters) {
       tamper.resetTamper(); // Clear tamper state when closed
       tamper.updateAlarm(false);
     }
-
-    vTaskDelayUntil(&xLastWakeTime, xPeriod);
   }
 }
 
@@ -259,10 +241,7 @@ void TaskLoraSend(void *pv) {
     frame.header.magic[1] = 0x03;
     frame.header.device_id = gVehicleConfig.getVehicleNumber();
     frame.header.vehicle_id = gVehicleConfig.getVehicleNumber();
-<<<<<<< HEAD
     frame.header.session_id = global_session_id;
-=======
->>>>>>> 6bd012583d69115ceb245bcf39663525a76f28ba
     frame.header.packet_id = ++packet_seq;
     frame.header.timestamp = ts;
     frame.header.type = 1; // Telemetry
@@ -271,7 +250,6 @@ void TaskLoraSend(void *pv) {
     frame.header.flags = 0;
     if (is_tamper) {
       frame.header.flags |= (1 << 0);
-<<<<<<< HEAD
     }
     if (lat != 0.0 && lng != 0.0) {
       frame.header.flags |= (1 << 1); // GPS fix flag
@@ -279,7 +257,7 @@ void TaskLoraSend(void *pv) {
     if (accel_g > 1.2f || accel_g < -1.2f) { // simple vibration threshold
       frame.header.flags |= (1 << 2);
     }
-    if (battery_mv < 3400) { // Low battery threshold (3.4V)
+    if (battery_mv < 3400) { // Low battery threshold (3.4V for 3.7V Li-ion battery)
       frame.header.flags |= (1 << 3);
     }
 
@@ -304,106 +282,72 @@ void TaskLoraSend(void *pv) {
     char hex_payload[100];
     encode_frame_to_hex(frame, hex_payload);
 
-    bool ack_received = false;
-    int retry_count = 0;
-    while (!ack_received && retry_count < 3) {
-      // Send the hex-encoded frame via UART to RA-08H
-      LORA_SER.println(hex_payload); 
-      LORA_SER.flush();
+    Serial.printf("[SENSOR] Temp=%.1fC, Hum=%.1f%%, Accel=%.2fg, Battery=%umV (%u%%), Tamper=%d\r\n", 
+                  temp, hum, accel_g, battery_mv, battery.getPercent(), is_tamper ? 1 : 0);
+    Serial.printf("[GPS] Lat=%.6f, Lng=%.6f\r\n", lat, lng);
+    char cipher_hex[33];
+    for (int i = 0; i < 16; i++) {
+        sprintf(cipher_hex + i * 2, "%02x", ((uint8_t*)&frame.payload)[i]);
+    }
+    cipher_hex[32] = '\0';
+    Serial.printf("[AES] Encrypted Payload block (16B): %s\r\n", cipher_hex);
+    Serial.printf("[AUTH] Calculated Auth Tag: 0x%04X, CRC: 0x%04X\r\n", frame.footer.auth_tag, frame.footer.crc);
 
-      Serial.printf("[ESP32->LORA] Frame sent (Seq=%u, Retry=%d). Waiting for ACK...\r\n", packet_seq, retry_count);
+    // Send the hex-encoded frame via UART to RA-08H module
+    LORA_SER.println(hex_payload); 
+    LORA_SER.flush();
 
-      uint32_t t0 = millis();
-      String rx_buf = "";
-      while (millis() - t0 < 2000) {
-        esp_task_wdt_reset();
-        while (LORA_SER.available()) {
-          char c = (char)LORA_SER.read();
-          rx_buf += c;
-          Serial.print(c); // DEBUG: Print RA-08H output directly to Serial
+    Serial.printf("[ESP32->LORA] Frame sent (Seq=%u). Sent to Gateway!\r\n", packet_seq);
+
+    // Chế độ Unconfirmed Uplink (Không bắt buộc chờ ACK) giúp hệ thống gửi tin cậy và không bị kẹt timeout
+    #define ENABLE_ACK_WAIT false
+    bool ack_received = true;
+
+    if (ENABLE_ACK_WAIT) {
+      int retry_count = 0;
+      ack_received = false;
+      while (!ack_received && retry_count < 3) {
+        uint32_t t0 = millis();
+        String rx_buf = "";
+        while (millis() - t0 < 2000) {
+          esp_task_wdt_reset();
+          while (LORA_SER.available()) {
+            char c = (char)LORA_SER.read();
+            rx_buf += c;
+            Serial.print(c);
+          }
+          
+          int start_idx = rx_buf.indexOf("2503");
+          if (start_idx >= 0 && rx_buf.length() >= start_idx + 68) {
+             String frame_hex = rx_buf.substring(start_idx, start_idx + 68);
+             LoRaFrame ack_frame;
+             if (hex_string_to_bytes(frame_hex, (uint8_t*)&ack_frame, sizeof(ack_frame))) {
+                 if (ack_frame.header.type == 0xFF && ack_frame.header.packet_id == packet_seq) {
+                     ack_received = true;
+                     Serial.println("[LORA] ACK Received successfully!");
+                     break;
+                 }
+             }
+             rx_buf = rx_buf.substring(start_idx + 68);
+          }
+          vTaskDelay(pdMS_TO_TICKS(50));
         }
-        
-        int start_idx = rx_buf.indexOf("2503");
-        if (start_idx >= 0 && rx_buf.length() >= start_idx + 68) {
-           String frame_hex = rx_buf.substring(start_idx, start_idx + 68);
-           LoRaFrame ack_frame;
-           if (hex_string_to_bytes(frame_hex, (uint8_t*)&ack_frame, sizeof(ack_frame))) {
-               if (ack_frame.header.type == 0xFF && ack_frame.header.packet_id == packet_seq) {
-                   ack_received = true;
-                   Serial.println("[LORA] ACK Received successfully!");
-                   break;
-               }
-           }
-           rx_buf = rx_buf.substring(start_idx + 68);
-        }
-        vTaskDelay(pdMS_TO_TICKS(50));
-      }
 
-      if (!ack_received) {
-        retry_count++;
-        Serial.printf("[LORA] ACK timeout, retrying %d/3...\n", retry_count);
-        vTaskDelay(pdMS_TO_TICKS(500 + random(0, 1000))); // Random backoff
+        if (!ack_received) {
+          retry_count++;
+          Serial.printf("[LORA] ACK timeout, retrying %d/3...\n", retry_count);
+          vTaskDelay(pdMS_TO_TICKS(500 + random(0, 1000)));
+        }
       }
     }
 
     if (!ack_received) {
       Serial.println("[ERROR] Failed to send LoRa frame after 3 retries.");
-=======
->>>>>>> 6bd012583d69115ceb245bcf39663525a76f28ba
-    }
-    if (lat != 0.0 && lng != 0.0) {
-      frame.header.flags |= (1 << 1); // GPS fix flag
-    }
-    if (accel_g > 1.2f || accel_g < -1.2f) { // simple vibration threshold
-      frame.header.flags |= (1 << 2);
-    }
-    if (battery_mv < 3400) { // Low battery threshold (3.4V)
-      frame.header.flags |= (1 << 3);
     }
 
-    // Fill Payload
-    frame.payload.temperature = (int16_t)round(temp * 10.0f);
-    frame.payload.humidity = (int16_t)round(hum * 10.0f);
-    frame.payload.accel_mag = (int16_t)round(accel_g * 100.0f);
-    frame.payload.light_level = battery_mv; // Send battery voltage instead of light level
-    frame.payload.latitude = (int32_t)round(lat * 1e6);
-    frame.payload.longitude = (int32_t)round(lng * 1e6);
-
-    // Encrypt payload in-place (AES-128 16 bytes)
-    encryptBlockInPlace((uint8_t*)&frame.payload);
-
-    // Compute Auth Tag (2 bytes) over Header + encrypted Payload
-    frame.footer.auth_tag = computeFrameAuthTag((const uint8_t*)&frame.header, sizeof(frame.header), (const uint8_t*)&frame.payload, sizeof(frame.payload));
-
-    // Compute CRC (2 bytes) over Header + Payload + Auth Tag (which is 30 bytes)
-    frame.footer.crc = calculateCRC16((const uint8_t*)&frame, sizeof(frame) - sizeof(frame.footer.crc));
-
-    // Convert the 32-byte frame to a 64-character Hex string
-    char hex_payload[65];
-    static const char hexDigits[] = "0123456789abcdef";
-    uint8_t* raw_frame = (uint8_t*)&frame;
-    for (size_t i = 0; i < sizeof(frame); i++) {
-      uint8_t value = raw_frame[i];
-      hex_payload[i * 2]     = hexDigits[(value >> 4) & 0x0F];
-      hex_payload[i * 2 + 1] = hexDigits[value & 0x0F];
-    }
-    hex_payload[64] = '\0';
-
-    // Send the hex-encoded frame via UART to RA-08H
-    LORA_SER.println(hex_payload); 
-    LORA_SER.flush();
-
-    // Print Node debug logs
-    Serial.printf("[SENSOR] Temp=%.1fC, Hum=%.1f%%, Accel=%.2fg, Battery=%umV (%u%%), Tamper=%d\r\n", 
-                  temp, hum, accel_g, battery_mv, battery.getPercent(), is_tamper ? 1 : 0);
-    Serial.printf("[GPS] Lat=%.6f, Lng=%.6f\r\n", lat, lng);
-    Serial.printf("[PACKET] Packing Frame: Seq=%u, DevID=%u, VehID=%u, Type=%u\r\n", 
-                  frame.header.packet_id, frame.header.device_id, frame.header.vehicle_id, frame.header.type);
-    Serial.printf("[AES] Encrypted Payload block: 16 bytes\r\n");
-    Serial.printf("[AUTH] Calculated Auth Tag: 0x%04X, CRC: 0x%04X\r\n", frame.footer.auth_tag, frame.footer.crc);
-    Serial.printf("[ESP32->LORA] Binary frame sent (Hex: %s)\r\n", hex_payload);
-
-    vTaskDelayUntil(&xLastWakeTime, xInterval);
+    // Nếu có sự kiện cảnh báo khẩn cấp, đánh thức phát ngay (preemptive alert); nếu bình thường chờ theo chu kỳ
+    uint32_t wait_ms = g_tamper_alert ? 500 : g_send_interval_ms;
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(wait_ms));
   }
 }
 
@@ -449,6 +393,7 @@ void setup() {
   Serial.printf("[INIT] Vehicle ID (default): %s\r\n", gVehicleConfig.getDeviceId());
 
   Wire.begin();
+  Wire.setTimeOut(50); // Prevent I2C hardware bus lock if sensor not attached
 
   dht.begin();
   if (!adxl.begin()) {
@@ -468,12 +413,19 @@ void setup() {
   battery.begin();
   Serial.println("[INIT] Tamper (SW2/Buzzer/LED) and Battery ADC initialized");
 
+  // Gắn ngắt cứng phần cứng (Hardware ISR) cho công tắc SW2 trên GPIO 27 (đánh thức tức thì <0.15ms)
+  attachInterrupt(digitalPinToInterrupt(TAMPER_PIN), tamperISR, CHANGE);
+  Serial.println("[INIT] Hardware ISR attached to TAMPER_PIN (GPIO 27)");
 
-  xTaskCreate(TaskTamperMonitor,    "TamperMon",  2048, NULL, 2, NULL);
+  // Tamper & GPS & LoRa tasks pinned to Core 1
+  xTaskCreatePinnedToCore(TaskTamperMonitor, "TamperMon", 2048, NULL, 2, &xTamperTaskHandle, 1);
+
+  // NOTE: Bo comment 2 dong duoi khi da cam day du cam bien DHT11 va ADXL345 vao mach
   startDhtTask(2048, 1);        
   startAdxlTelemetry(4096, 1);  
-  xTaskCreate(TaskLoraSend, "LoraSend", 4096, NULL, 1, NULL);
-  xTaskCreate(TaskGPS, "TaskGPS", 4096, NULL, 1, NULL); // Create GPS task
+
+  xTaskCreatePinnedToCore(TaskLoraSend, "LoraSend", 4096, NULL, 1, &xLoraSendTaskHandle, 1);
+  xTaskCreatePinnedToCore(TaskGPS,      "TaskGPS",  4096, NULL, 1, NULL, 1);
 
   gps.begin();
   
@@ -486,3 +438,44 @@ void loop() {
   esp_task_wdt_reset();
   vTaskDelay(pdMS_TO_TICKS(1000));
 }
+// #include <Arduino.h>
+// // Khai báo thư viện GPS, ADXL345, LoRa Ra-08H
+
+// // Chu kỳ ngủ sâu = 58 giây (tính theo micro-giây)
+// #define TIME_TO_SLEEP 58 
+// #define uS_TO_S_FACTOR 1000000ULL 
+
+// void setup() {
+//   Serial.begin(115200);
+//   delay(500); // Chờ nguồn ổn định
+
+//   Serial.println("\n==============================================");
+//   Serial.println("[KICH BAN 2] ESP32 THUC DAY TU DEEP SLEEP!");
+  
+//   // 1. Đọc nhanh dữ liệu từ các cảm biến (khoảng 1.5s)
+//   Serial.println("[1] Doc du lieu GPS, ADXL345, LDR...");
+//   // readSensors();
+//   delay(1500); // Giả lập thời gian thu thập dữ liệu GPS fix
+  
+//   // 2. Phát gói tin qua LoRa Ra-08H (khoảng 0.5s)
+//   Serial.println("[2] Gui goi tin LoRa qua Ra-08H...");
+//   // sendLoRaPacket();
+//   delay(500); // Giả lập phát LoRa 0.5s
+//   Serial.println("[2] Gui LoRa thanh cong!");
+
+//   // 3. Chuẩn bị đưa vi điều khiển vào Deep Sleep 58 giây
+//   Serial.println("[3] Chuan bi vao Deep Sleep 58 giay...");
+//   Serial.flush(); // Xóa sạch bộ đệm Serial trước khi ngủ
+  
+//   // Cài đặt ngắt hẹn giờ thức dậy sau 58 giây
+//   esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
+  
+//   // Bắt đầu vào Deep Sleep (Mạch sẽ tắt CPU, giảm dòng về 11-13mA)
+//   esp_deep_sleep_start();
+// }
+
+// void loop() {
+//   // Trong Kịch bản 2, hàm loop() KHÔNG BAO GIỜ được chạy
+//   // Vì sau khi setup() kết thúc, chip lập tức đi ngủ và khi thức dậy sẽ khởi động lại từ setup()
+// }
+

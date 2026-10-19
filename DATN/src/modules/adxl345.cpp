@@ -152,5 +152,5 @@ void TaskADXLData(void *pvParameters) {
 }
 
 void startAdxlTelemetry(unsigned long stackSize, UBaseType_t priority) {
-  xTaskCreate(TaskADXLData, "ADXL Data", stackSize, NULL, priority, NULL);
+  xTaskCreatePinnedToCore(TaskADXLData, "ADXL Data", stackSize, NULL, priority, NULL, 1);
 }

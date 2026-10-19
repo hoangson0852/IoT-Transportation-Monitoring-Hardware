@@ -19,7 +19,10 @@ struct LoRaFramePayload {
     int16_t temperature;    // temp * 10
     int16_t humidity;       // hum * 10
     int16_t accel_mag;      // accel * 100
-    uint16_t light_level;   // LDR (0 - 1023) or battery_mv
+    union {
+        uint16_t battery_mv;    // Battery voltage in mV (Li-ion 18650)
+        uint16_t light_level;   // Legacy alias
+    };
     int32_t latitude;       // lat * 1e6
     int32_t longitude;      // lng * 1e6
 };

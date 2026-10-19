@@ -24,12 +24,9 @@ private:
     // ADC parameters
     static const uint8_t SAMPLE_SIZE = 10;
     
-    // Voltage conversion parameters
-    // V_batt = V_adc * 2 (due to 100k / 100k voltage divider)
-    // V_adc = raw_adc * 3.3V / 4095
-    // So V_batt = raw_adc * 6.6V / 4095 = raw_adc * 1.6117 mV/unit
-    // We calibrate with a multiplier if needed (e.g. 1.6117f)
-    const float ADC_TO_MV = 1.6117f;
+    // Voltage conversion parameters calibrated with multimeter (3.80V actual vs 3.084V uncalibrated)
+    // Multiplier = 1.6117 * (3800 / 3084) = 1.9858f
+    const float ADC_TO_MV = 1.9858f;
 };
 
 #endif // BATTERY_MODULE_H
